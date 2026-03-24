@@ -13,6 +13,14 @@ import sys
 from pathlib import Path
 
 from usage_analyzer import load_usage, analyze_all_plans, compute_date_range
+from ev_analyzer import (
+    load_chargepoint,
+    build_ev_hourly_map,
+    separate_ev_from_household,
+    compute_ev_optimized_cost,
+    get_cheapest_rate_for_plan,
+)
+from rate_plans import RATE_PLANS
 
 
 def format_currency(amount: float) -> str:
@@ -163,6 +171,118 @@ def main():
             os_annual = overnight_result["total_cost"] * annualization_factor
             print(f"  Overnight Savers would cost {format_currency(os_annual)}/yr -- its summer")
             print("  off-peak and peak rates offset the super off-peak savings.")
+
+    # ===================================================================
+    # EV-OPTIMIZED ANALYSIS using ChargePoint data
+    # ===================================================================
+    cp_path = str(Path(csv_path).parent / "chargepoint.csv")
+    if Path(cp_path).exists():
+        print()
+        print_separator("*")
+        print("  EV-OPTIMIZED ANALYSIS (using ChargePoint data)")
+        print_separator("*")
+
+        sessions = load_chargepoint(cp_path)
+        ev_hourly = build_ev_hourly_map(sessions)
+        household_records, daily_ev_kwh = separate_ev_from_household(records, ev_hourly)
+
+        total_ev_kwh = sum(daily_ev_kwh.values())
+        total_household_kwh = sum(r["kwh"] for r in household_records)
+        ev_days_with_charging = sum(1 for v in daily_ev_kwh.values() if v > 0)
+
+        print(f"\n  ChargePoint sessions:  {len(sessions)}")
+        print(f"  Total EV energy:       {total_ev_kwh:,.1f} kWh ({total_ev_kwh / total_kwh * 100:.1f}% of total DTE usage)")
+        print(f"  Household energy:      {total_household_kwh:,.1f} kWh")
+        print(f"  Days with EV charging: {ev_days_with_charging}")
+        print(f"  Avg charge per day:    {total_ev_kwh / max(ev_days_with_charging, 1):,.1f} kWh")
+
+        # Show cheapest charging window per plan
+        from datetime import datetime as dt_cls
+        sample_summer = dt_cls(2025, 7, 15)  # Tuesday in summer
+        sample_winter = dt_cls(2025, 1, 15)  # Wednesday in winter
+        print(f"\n  Cheapest EV charging rate per plan:")
+        print(f"  {'Plan':<45s} {'Summer':>12s} {'Non-Summer':>12s}  Charge Window")
+        print(f"  {'-'*44} {'-'*12} {'-'*12}  {'-'*20}")
+        for plan in RATE_PLANS:
+            s_rate, s_tier, s_window = get_cheapest_rate_for_plan(plan, sample_summer)
+            w_rate, w_tier, w_window = get_cheapest_rate_for_plan(plan, sample_winter)
+            print(f"  {plan['name']:<45s} {s_rate*100:>10.2f}c  {w_rate*100:>10.2f}c  {w_window}")
+
+        # Compute optimized costs per plan
+        ev_results = []
+        for plan in RATE_PLANS:
+            result = compute_ev_optimized_cost(household_records, daily_ev_kwh, plan)
+            ev_results.append(result)
+        ev_results.sort(key=lambda r: r["total_cost"])
+
+        cheapest_ev = ev_results[0]["total_cost"]
+
+        print()
+        print_separator()
+        print("  EV-OPTIMIZED PLAN COMPARISON")
+        print("  (Household at actual times + EV at cheapest hours per plan)")
+        print_separator()
+
+        for i, result in enumerate(ev_results):
+            rank = i + 1
+            diff = result["total_cost"] - cheapest_ev
+
+            print(f"\n  #{rank}  {result['plan_name']}")
+            print(f"      Total Cost:     {format_currency(result['total_cost'])}", end="")
+            if diff > 0:
+                print(f"  (+{format_currency(diff)})")
+            else:
+                print(f"  ** CHEAPEST **")
+
+            print(f"      Household:      {format_currency(result['household_cost'])}  ({result['household_kwh']:,.1f} kWh)")
+            print(f"      EV Charging:    {format_currency(result['ev_cost'])}  ({result['ev_kwh']:,.1f} kWh)")
+            if result["ev_kwh"] > 0:
+                avg_ev_rate = result["ev_cost"] / result["ev_kwh"] * 100
+                print(f"      Avg EV rate:    {avg_ev_rate:.2f} cents/kWh")
+
+            # Show EV rate tiers used
+            for tier, rate in sorted(result["ev_rate_info"].items(), key=lambda x: x[1]):
+                print(f"        -> {tier}: {rate*100:.2f}c/kWh")
+
+        # Annualized EV-optimized
+        print()
+        print_separator()
+        print(f"  EV-OPTIMIZED ANNUALIZED ESTIMATES ({num_days} days -> 365)")
+        print_separator()
+
+        for result in ev_results:
+            annual = result["total_cost"] * annualization_factor
+            annual_ev = result["ev_cost"] * annualization_factor
+            print(f"  {result['plan_name']:<45s} {format_currency(annual):>10s}/yr  (EV: {format_currency(annual_ev)}/yr)")
+
+        # Final recommendation
+        print()
+        print_separator("*")
+        print("  FINAL RECOMMENDATION (EV-OPTIMIZED)")
+        print_separator("*")
+
+        ev_enrollable = [r for r in ev_results if r["plan_key"] != "dynamic_peak"]
+        best_ev = ev_enrollable[0]
+        best_ev_annual = best_ev["total_cost"] * annualization_factor
+        best_ev_annual_ev_only = best_ev["ev_cost"] * annualization_factor
+
+        print(f"\n  Best plan for your EV + household: {best_ev['plan_name']}")
+        print(f"  Projected annual cost: {format_currency(best_ev_annual)}")
+        print(f"    - Household: {format_currency((best_ev['household_cost']) * annualization_factor)}/yr")
+        print(f"    - EV charging: {format_currency(best_ev_annual_ev_only)}/yr")
+
+        if len(ev_enrollable) > 1:
+            second_ev = ev_enrollable[1]
+            savings = (second_ev["total_cost"] - best_ev["total_cost"]) * annualization_factor
+            print(f"  Saves {format_currency(savings)}/yr vs {second_ev['plan_name']}")
+
+        # Show what time to charge
+        sample_date = dt_cls(2025, 7, 15)
+        _, _, best_window = get_cheapest_rate_for_plan(
+            next(p for p in RATE_PLANS if p["key"] == best_ev["plan_key"]),
+            sample_date,
+        )
+        print(f"\n  Schedule your EV to charge during: {best_window}")
 
     print()
 
